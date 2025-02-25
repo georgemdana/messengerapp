@@ -9,6 +9,7 @@ import urllib.parse
 from datetime import datetime
 import base64
 import sys
+from io import StringIO
 
 def create_tracking_link(base_url, recipient_id):
     tracking_id = str(uuid.uuid4())
@@ -26,8 +27,39 @@ def load_tracking_info():
     except FileNotFoundError:
         return []
 
+# Add the test_sms function here
+def test_sms(phone, name, message):
+    # Normalize phone number
+    if not phone.startswith("+1") and len(phone) == 10:
+        phone = f"+1{phone}"
+
+    sms_applescript = f'''
+    tell application "Messages"
+        set targetBuddy to "{phone}"
+        set textMessage to "Hello {name},\n\n{message}"
+        send textMessage to buddy targetBuddy
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", sms_applescript],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(f"Success: {result.stdout}")
+        return f"SMS sent to {name} at {phone}", None
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e.stderr}")
+        return f"Failed to send SMS to {name} ({phone}): {e.stderr}", e.stderr
+
 def send_imessage(phone, name, message, tracking_link, image_path=None):
-    text_applescript = f'''
+    # Normalize phone number
+    if not phone.startswith("+1") and len(phone) == 10:
+        phone = f"+1{phone}"
+
+    # AppleScript for iMessage
+    imessage_applescript = f'''
     tell application "Messages"
         set targetBuddy to "{phone}"
         set targetService to id of 1st service whose service type = iMessage
@@ -37,24 +69,86 @@ def send_imessage(phone, name, message, tracking_link, image_path=None):
     end tell
     '''
 
-    try:
-        subprocess.run(["osascript", "-e", text_applescript], check=True)
-        result = f"Text message sent to {name} at {phone}"
-        if image_path:
-            image_applescript = f'''
-            tell application "Messages"
-                set targetBuddy to "{phone}"
-                set targetService to id of 1st service whose service type = iMessage
-                set theBuddy to participant targetBuddy of account id targetService
-                send POSIX file "{image_path}" to theBuddy
-            end tell
-            '''
-            subprocess.run(["osascript", "-e", image_applescript], check=True)
-            result += f" and image sent from {image_path}"
-        return result
-    except subprocess.CalledProcessError as e:
-        return f"Error sending to {name}: {str(e)}"
+    # AppleScript for SMS
+    sms_applescript = f'''
+    tell application "Messages"
+        set targetBuddy to "{phone}"
+        set textMessage to "Hello {name},\n\n{message}{tracking_link}"
+        send textMessage to buddy targetBuddy
+    end tell
+    '''
 
+    # Try iMessage first
+    try:
+        imessage_result = subprocess.run(
+            ["osascript", "-e", imessage_applescript],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(f"iMessage attempt: {imessage_result.stdout}")
+        time.sleep(2)
+
+        # Check delivery
+        check_applescript = f'''
+        tell application "Messages"
+            set targetBuddy to "{phone}"
+            set theBuddy to buddy targetBuddy
+            set theChat to chat of theBuddy
+            set theMessages to messages of theChat
+            if (count of theMessages) > 0 then
+                set latestMessage to item -1 of theMessages
+                return (delivered of latestMessage)
+            else
+                return false
+            end if
+        end tell
+        '''
+        check_result = subprocess.run(
+            ["osascript", "-e", check_applescript],
+            capture_output=True,
+            text=True,
+            check=True
+        ).stdout.strip()
+        print(f"Delivery check: {check_result}")
+
+        if check_result == "true":
+            result = f"Text message sent to {name} at {phone} via iMessage"
+            if image_path:
+                image_applescript = f'''
+                tell application "Messages"
+                    set targetBuddy to "{phone}"
+                    set targetService to id of 1st service whose service type = iMessage
+                    set theBuddy to participant targetBuddy of account id targetService
+                    send POSIX file "{image_path}" to theBuddy
+                end tell
+                '''
+                subprocess.run(["osascript", "-e", image_applescript], check=True)
+                result += f" and image sent from {image_path}"
+            return result, None
+
+    except subprocess.CalledProcessError as e:
+        print(f"iMessage failed: {e.stderr}")
+
+    # Fallback to SMS
+    try:
+        sms_result = subprocess.run(
+            ["osascript", "-e", sms_applescript],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(f"SMS attempt: {sms_result.stdout}")
+        return f"Text message sent to {name} at {phone} via SMS", None
+    except subprocess.CalledProcessError as e:
+        print(f"SMS failed: {e.stderr}")
+        return (
+            f"Failed to send to {name} ({phone}) via iMessage and SMS: {e.stderr}",
+            f"SMS error: {e.stderr}"
+        )
+    except Exception as e:
+        return f"Unexpected error sending to {name}: {str(e)}", str(e)
+    
 def get_imessage_responses(phone):
     applescript = f'''
     tell application "Messages"
@@ -120,6 +214,9 @@ def delete_campaign(campaign_name):
         json.dump(campaigns, f)
 
 def main():
+    # Use the full_page parameter to maximize the app's width
+    st.set_page_config(layout="wide")
+
     st.title("iMessage Sender App")
 
     with st.sidebar:
@@ -145,21 +242,22 @@ def main():
             """,
             unsafe_allow_html=True,
         )
-
         selected_tab = st.radio(
             "Select View",
-            ["Create Campaign", "Send Messages", "Campaign Statistics"]
+            ["Create Campaign", "Send Messages", "Send Manual Message", "Campaign Statistics"]
         )
 
         # Place the disclaimer at the very end
         st.markdown(
             """
             <div class="disclaimer">
-            <strong>Note:</strong> This application sends only <em>one</em> iMessage at a time. 
-            Attempting to send multiple messages simultaneously is not supported 
-            and may lead to unexpected behavior or errors. Please ensure you 
-            click the 'Send' button for each recipient individually and wait 
+            <strong>Note:</strong> This application sends only <em>one</em> iMessage at a time.
+            Attempting to send multiple messages simultaneously is not supported
+            and may lead to unexpected behavior or errors. Please ensure you
+            click the 'Send' button for each recipient individually and wait
             for confirmation before proceeding to the next recipient.
+            <strong>Important:</strong> iMessages may not be delivered to non-Apple (Android) devices.
+            If a message fails to send, try sending a standard text message manually.
             </div>
             """,
             unsafe_allow_html=True
@@ -169,6 +267,8 @@ def main():
         create_campaign_tab()
     elif selected_tab == "Send Messages":
         send_messages_tab()
+    elif selected_tab == "Send Manual Message":
+        send_manual_message_tab()  # Added the new tab function
     elif selected_tab == "Campaign Statistics":
         campaign_statistics_tab()
 
@@ -178,7 +278,52 @@ def create_campaign_tab():
     uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
 
     if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
+        # Define expected column names
+        expected_columns = ["Phone", "Name", "Age", "Sex", "Party Last Primary", "Precinct Name", "Zip Code"]  # Correct column name
+        # Read the file content as bytes
+        csv_bytes = uploaded_file.read()
+        df = None  # Initialize df outside the loop
+
+        # Try to decode the bytes with different encodings
+        for encoding in ['utf-16', 'utf-8-sig', 'utf-16-le', 'utf-16-be', 'latin1']:  # prioritize utf-16
+            try:
+                # Decode the bytes into a string
+                csv_data = csv_bytes.decode(encoding)
+
+                # Try to parse the CSV with the appropriate delimiter
+                try:
+                    df = pd.read_csv(StringIO(csv_data), delimiter='\t')
+
+                    # Check for the expected columns
+                    missing_columns = [col for col in expected_columns if col not in df.columns]
+                    if missing_columns:
+                        st.error(
+                            f"The following columns are missing from the CSV file: {', '.join(missing_columns)}. Please ensure the CSV file contains all the required columns.")
+                        df = None
+                    else:
+                        st.write(f"Successfully read CSV!")
+                    break  # If successful, exit the loop
+
+                except Exception as e:
+                    st.write(f"Failed to read CSV with encoding: {encoding}, delimiter: '\\t'. Error: {e}")
+                    continue  # If reading fails, continue to next encoding
+
+            except UnicodeDecodeError:
+                st.write(f"Failed to decode with encoding: {encoding}")
+                continue  # If decoding fails, continue to next encoding
+
+        if df is None:
+            st.error("Failed to read CSV with all attempted encodings and delimiters. Please check the file format.")
+            return
+
+        # Check if DataFrame is empty after parsing
+        if df.empty:
+            st.error("DataFrame is empty after parsing. Please check the file format and try again.")
+            return
+
+        row_count = len(df)  # Get the number of rows
+        st.write(f"Number of rows in uploaded from CSV: {row_count}")  # Display row count
+
         st.write("Preview of uploaded data:")
         st.dataframe(df.head())
 
@@ -192,7 +337,7 @@ def create_campaign_tab():
             st.text_area("Message", value=f"Hello [Name],\n{message}\n[Tracking Link]", height=100, disabled=True)
         with col2:
             if image_file:
-                st.image(image_file, caption="Image to be sent", use_column_width=True)
+                st.image(image_file, caption="Campaign Image", use_column_width=True)
             else:
                 st.write("No image selected")
 
@@ -205,9 +350,17 @@ def create_campaign_tab():
             results = []
 
             # store the data without sending the messages
-            results = [{"name": row['Name'], "phone": row['Phone'], "result": "Not Sent", "tracking_id": None} for index, row in df.iterrows()]
-            save_campaign_data(campaign_name, results, tracking_info, message, image_data, base_url)
+            try:
+                results = [{"Phone": row['Phone'], "Name": row['Name'], "Age": row['Age'], "Sex": row['Sex'],
+                            "Party Last Primary": row['Party Last Primary'], "Precinct Name": row['Precinct Name'],
+                            "Zip Code": row['Zip Code'], "result": "Not Sent", "tracking_id": None} for index, row in
+                           df.iterrows()]
+            except KeyError as e:
+                st.error(
+                    f"KeyError: {e}. This indicates that a required column is missing from your DataFrame. Please double-check the CSV file and ensure all required columns are present and named correctly.")
+                return
 
+            save_campaign_data(campaign_name, results, tracking_info, message, image_data, base_url)
             st.success(f"Campaign '{campaign_name}' created successfully!")
 
 def send_messages_tab():
@@ -222,19 +375,22 @@ def send_messages_tab():
     campaign_data = next(c for c in campaigns if c['name'] == selected_campaign)
 
     # Campaign Details in one row
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns([2, 1.5, 1.5, 2])  # Added a fourth column
     with col1:
         st.write(f"**Campaign Name:** {campaign_data['name']}")
     with col2:
         st.write(f"**Date Created:** {campaign_data['date'][:10]}")
     with col3:
         st.write(f"**Time Created:** {campaign_data['date'][11:16]}")  # Extract time
+    with col4:  # Added the row count to the new column
+        st.write(f"**Row Count:** {len(campaign_data['results'])}")
 
     # Message Preview (Same as Create Campaign)
     st.subheader("Message Preview")
     col1, col2 = st.columns(2)
     with col1:
-        st.text_area("Message", value=f"Hello [Name],\n{campaign_data['message_text']}\n[Tracking Link]", height=100, disabled=True)
+        st.text_area("Message", value=f"Hello [Name],\n{campaign_data['message_text']}\n[Tracking Link]", height=100,
+                     disabled=True)
     with col2:
         if campaign_data['image_data']:
             image_bytes = base64.b64decode(campaign_data['image_data'])
@@ -243,29 +399,110 @@ def send_messages_tab():
             st.write("No image selected")
 
     st.subheader("Send Individual Messages")
-    for i, result in enumerate(campaign_data['results']):
-        name = result['name']
-        phone = result['phone']
-        key = f"send_button_{i}"  # Unique key for each button/message pair
 
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.write(f"**{name}** ({phone})")
-        with col2:
+    # Column Titles
+    column_titles = ["Name (Phone)", "Age", "Sex", "Party", "Last Primary", "Precinct", "Zip", "Action"]
+    column_widths = [3, 1, 1, 1.5, 2, 2.5, 1.5, 1.5]  # Same widths as data columns
+    title_cols = st.columns(column_widths)
+    for i, title in enumerate(column_titles):
+        title_cols[i].write(f"**{title}**")
+
+    # Pagination
+    if 'start_index' not in st.session_state:
+        st.session_state.start_index = 0
+    if 'end_index' not in st.session_state:
+        st.session_state.end_index = min(100, len(campaign_data['results']))
+
+    def load_more():
+        st.session_state.start_index = st.session_state.end_index
+        st.session_state.end_index = min(st.session_state.end_index + 100, len(campaign_data['results']))
+
+    # Display messages for the current page
+    for i in range(st.session_state.start_index, st.session_state.end_index):
+        result = campaign_data['results'][i]
+
+        # Create columns for each piece of information
+        cols = st.columns(column_widths)  # Use the same widths as titles
+
+        cols[0].write(f"**{result['Name']}** ({result['Phone']})")
+        cols[1].write(f"{result['Age']}")
+        cols[2].write(f"{result['Sex']}")
+        cols[3].write(f"{result['Party Last Primary']}")
+        cols[4].write(f"{result.get('Party Last Primary', 'N/A')}")
+        cols[5].write(f"{result['Precinct Name']}")
+        cols[6].write(f"{result['Zip Code']}")
+
+        # Button column
+        with cols[7]:
+            key = f"send_button_{i}"
             if key not in st.session_state:
-                st.session_state[key] = False  # Initialize state to False (not sent)
+                st.session_state[key] = False
 
             if not st.session_state[key]:
-                if st.button(f"Send to {name}", key=f"button_{i}"):
-                    tracking_link, tracking_id = create_tracking_link(campaign_data['base_url'], phone)
-                    personalized_message = campaign_data['message_text'].replace("[Name]", name)
-                    result_message = send_imessage(phone, name, personalized_message, tracking_link, None)
+                if st.button("Send", key=f"button_{i}", help=f"Send to {result['Name']}",
+                             use_container_width=True):
+                    tracking_link, tracking_id = create_tracking_link(campaign_data['base_url'], result['Phone'])
+                    personalized_message = campaign_data['message_text'].replace("[Name]", result['Name'])
+                    result_message, error_message = send_imessage(result['Phone'], result['Name'], personalized_message,
+                                                     tracking_link, None)
+                    if error_message:
+                        st.warning(f"Message to {result['Name']} may not have been delivered (potential non-Apple device). Error: {error_message}")
+                    else:
+                        st.success(f"Message sent to {result['Name']}", icon="✅")
+
                     result['result'] = result_message
-                    save_campaign_data(campaign_data['name'], campaign_data['results'], campaign_data['tracking_info'], campaign_data['message_text'], campaign_data['image_data'], campaign_data['base_url'])
-                    st.session_state[key] = True  # Update state to True (sent)
-                    st.experimental_rerun()  # Refresh to reflect the change
+                    save_campaign_data(campaign_data['name'], campaign_data['results'],
+                                        campaign_data['tracking_info'],
+                                        campaign_data['message_text'], campaign_data['image_data'],
+                                        campaign_data['base_url'])
+                    st.session_state[key] = True
+                    st.experimental_rerun()
             else:
-                st.success(f"Sent!")
+                st.success("Sent", icon="✅")
+
+    # Load More button
+    if st.session_state.end_index < len(campaign_data['results']):
+        st.button("Load 100 More", on_click=load_more)
+
+def send_manual_message_tab():
+    st.header("Send Manual Message")
+
+    name = st.text_input("Recipient Name:")
+    phone = st.text_input("Recipient Phone Number:")
+
+    campaigns = load_campaigns()
+    if not campaigns:
+        st.warning("No campaigns available. Please create a campaign in the 'Create Campaign' tab first.")
+        return
+
+    selected_campaign = st.selectbox("Select Campaign", options=[c['name'] for c in campaigns])
+    campaign_data = next(c for c in campaigns if c['name'] == selected_campaign)
+    base_url = campaign_data['base_url']
+    message_text = campaign_data['message_text']
+
+    # Message Preview
+    st.subheader("Message Preview")
+    preview_message = message_text.replace("[Name]", name) if name else message_text
+    st.text_area("Preview", value=f"Hello {name},\n{preview_message}\n[Tracking Link]", height=100, disabled=True)
+
+    # Add a test SMS button
+    if st.button("Test SMS Send"):
+        result, error = test_sms(phone, name, "Test SMS from Streamlit")
+        if error:
+            st.error(result)
+        else:
+            st.success(result)
+
+    # Existing send button
+    if st.button("Send Message", disabled=not (name and phone and base_url and message_text)):
+        tracking_link, tracking_id = create_tracking_link(base_url, phone)
+        personalized_message = message_text.replace("[Name]", name)
+        result_message, error_message = send_imessage(phone, name, personalized_message, tracking_link, None)
+        if error_message:
+            st.warning(f"Message to {name} may not have been delivered. Error: {error_message}")
+        else:
+            st.success(f"Message sent to {name}", icon="✅")
+
 
 def campaign_statistics_tab():
     st.header("Campaign Statistics")
@@ -287,7 +524,7 @@ def campaign_statistics_tab():
     if campaign_data['image_data']:
         st.image(base64.b64decode(campaign_data['image_data']), caption="Sent Image", use_column_width=True)
     else:
-        st.write("No image was sent with this campaign.")
+        st.write("No image selected")
 
     successful_sends = sum(1 for msg in campaign_data['results'] if not msg['result'].startswith("Error"))
     failed_sends = len(campaign_data['results']) - successful_sends
@@ -300,7 +537,7 @@ def campaign_statistics_tab():
         st.subheader("Failed Messages")
         failed_messages = [msg for msg in campaign_data['results'] if msg['result'].startswith("Error")]
         for msg in failed_messages:
-            st.write(f"Name: {msg['name']}, Phone: {msg['phone']}")
+            st.write(f"Name: {msg['Name']}, Phone: {msg['Phone']}")
             st.write(f"Error: {msg['result']}")
             st.write("---")
 
@@ -316,7 +553,7 @@ def campaign_statistics_tab():
 
     st.subheader("Detailed Statistics")
     for tracking_id, info in tracking_info.items():
-        st.write(f"Name: {info['name']}, Phone: {info['phone']}, Clicked: {'Yes' if info['clicked'] else 'No'}")
+        st.write(f"Name: {info['Name']}, Phone: {info['Phone']}, Clicked: {'Yes' if info['clicked'] else 'No'}")
 
     # Delete Campaign
     st.subheader("Delete Campaign")
